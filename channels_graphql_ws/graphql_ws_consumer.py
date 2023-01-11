@@ -232,7 +232,7 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
         for protocol in [GRAPHQL_WS_SUBPROTOCOL, TRANSPORT_WS_SUBPROTOCOL]:
             if protocol in self.scope["subprotocols"]:
                 self.subprotocol = protocol
-        
+
         if not self.subprotocol:
             raise Exception(f"WebSocket client does not request for a known subprotocol.")
 
@@ -336,9 +336,9 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
                     op_lock.release()
 
             task = on_start()
-        
+
         elif msg_type == "PING":
-            task = self._on_ping(payload={})
+            task = self._send_ping(payload={})
 
         elif msg_type == "SUBSCRIBE":
             op_id = content["id"]
@@ -351,7 +351,7 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
             self._operation_locks[op_id] = op_lock
             await op_lock.acquire()
 
-            async def on_start():
+            async def on_subscribe():
                 try:
                     await self._on_gql_start(
                         operation_id=op_id, payload=content["payload"]
@@ -359,7 +359,7 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
                 finally:
                     op_lock.release()
 
-            task = on_start()
+            task = on_subscribe()
 
         elif msg_type == "COMPLETE":
             op_id = content["id"]
