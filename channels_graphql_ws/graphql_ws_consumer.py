@@ -66,6 +66,7 @@ LOG = logging.getLogger(__name__)
 
 # WebSocket subprotocol used for the GraphQL.
 GRAPHQL_WS_SUBPROTOCOL = "graphql-ws"
+TRANSPORT_WS_SUBPROTOCOL = "graphql-transport-ws"
 
 
 class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
@@ -219,6 +220,8 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
         """Handle new WebSocket connection."""
         # Assert we run in a proper thread.
         self._assert_thread()
+        self.connection_context = None
+        self.subprotocol = None
 
         # Check the subprotocol told by the client.
         #
@@ -226,16 +229,15 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
         # starting with Python 3.7 it is a bytes. This can be a proper
         # change or just a bug in the Channels to be fixed. So let's
         # accept both variants until it becomes clear.
-        assert GRAPHQL_WS_SUBPROTOCOL in (
-            (sp.decode() if isinstance(sp, bytes) else sp)
-            for sp in self.scope["subprotocols"]
-        ), (
-            f"WebSocket client does not request for the subprotocol "
-            f"{GRAPHQL_WS_SUBPROTOCOL}!"
-        )
+        for protocol in [GRAPHQL_WS_SUBPROTOCOL, TRANSPORT_WS_SUBPROTOCOL]:
+            if protocol in self.scope["subprotocols"]:
+                self.subprotocol = protocol
+        
+        if not self.subprotocol:
+            raise Exception(f"WebSocket client does not request for a known subprotocol.")
 
         # Accept connection with the GraphQL-specific subprotocol.
-        await self.accept(subprotocol=GRAPHQL_WS_SUBPROTOCOL)
+        await self.accept(subprotocol=self.subprotocol)
 
     async def disconnect(self, code):
         """Handle WebSocket disconnect.
@@ -306,7 +308,7 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
         msg_type = content["type"].upper()
 
         if msg_type == "CONNECTION_INIT":
-            task = self._on_gql_connection_init(payload=content["payload"])
+            task = self._on_gql_connection_init(payload={})
 
         elif msg_type == "CONNECTION_TERMINATE":
             task = self._on_gql_connection_terminate()
@@ -334,6 +336,40 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
                     op_lock.release()
 
             task = on_start()
+        
+        elif msg_type == "PING":
+            task = self._on_ping(payload={})
+
+        elif msg_type == "SUBSCRIBE":
+            op_id = content["id"]
+
+            if op_id in self._operation_locks:
+                raise graphql.error.GraphQLError(
+                    f"Operation with msg_id={op_id} is already running!"
+                )
+            op_lock = asyncio.Lock()
+            self._operation_locks[op_id] = op_lock
+            await op_lock.acquire()
+
+            async def on_start():
+                try:
+                    await self._on_gql_start(
+                        operation_id=op_id, payload=content["payload"]
+                    )
+                finally:
+                    op_lock.release()
+
+            task = on_start()
+
+        elif msg_type == "COMPLETE":
+            op_id = content["id"]
+
+            async def on_stop():
+                # Will until START message processing finishes, if any.
+                async with self._operation_locks.setdefault(op_id, asyncio.Lock()):
+                    await self._on_gql_stop(operation_id=op_id)
+
+            task = on_stop()
 
         elif msg_type == "STOP":
             op_id = content["id"]
@@ -464,7 +500,7 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
     # ---------------------------------------------------------- GRAPHQL PROTOCOL EVENTS
 
     async def _on_gql_connection_init(self, payload):
-        """Process the CONNECTION_INIT message.
+        """Process the CONNECTION_INIT or SUBSCRIBE message.
 
         Start sending keepalive messages if `send_keepalive_every` set.
         Respond with either CONNECTION_ACK or CONNECTION_ERROR message.
@@ -834,6 +870,11 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
             {"type": "connection_error", "payload": self._format_error(error)}
         )
 
+    async def _send_ping(self):
+        """Sent in reply to the `ping` request."""
+        self._assert_thread()
+        await self.send_json({"type": "pong", "payload": {}})
+
     async def _send_gql_data(
         self, operation_id, data: dict, errors: Optional[Sequence[Exception]]
     ):
@@ -863,10 +904,15 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
                 operation_id,
                 "".join(traceback.format_exception(type(ex), ex, tb)).strip(),
             )
+        
+        if self.subprotocol == GRAPHQL_WS_SUBPROTOCOL:
+            type_value = "data"
+        elif self.subprotocol == TRANSPORT_WS_SUBPROTOCOL:
+            type_value = "next"
 
         await self.send_json(
             {
-                "type": "data",
+                "type": type_value,
                 "id": operation_id,
                 "payload": {
                     "data": data,
