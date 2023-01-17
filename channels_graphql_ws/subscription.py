@@ -420,6 +420,9 @@ class Subscription(graphene.ObjectType):
 
         def unsubscribed_callback():
             """Call `unsubscribed` notification."""
+
+            # print(">>>>>> <<<<< >>> INSIDE UNSUBSCRIBED CALLBACK >>>> <<<< >>>")
+
             if cls._meta.unsubscribed is None:
                 return None
             result = cls._meta.unsubscribed(None, info, *args, **kwds)

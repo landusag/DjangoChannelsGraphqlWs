@@ -248,6 +248,11 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
         # Assert we run in a proper thread.
         self._assert_thread()
 
+        # Allow for unsubscribe() to run when a client disconnects
+        for sid in self._subscriptions.copy():
+            subinf = self._subscriptions[sid]
+            await self._run_in_worker(subinf.unsubscribed_callback)
+
         # Print debug or warning message depending on the value of the
         # connection close code. We consider all reserved codes (<999),
         # 1000 "Normal Closure", and 1001 "Going Away" as OK.
@@ -307,11 +312,20 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
         # Extract message type based on which we select how to proceed.
         msg_type = content["type"].upper()
 
+        # print("MESSAGE RECEIVED: ", msg_type, content)
+
         if msg_type == "CONNECTION_INIT":
             task = self._on_gql_connection_init(payload={})
 
         elif msg_type == "CONNECTION_TERMINATE":
             task = self._on_gql_connection_terminate()
+
+            # Wait for existing operations to complete. This can occur when the STOP and TERMINATE calls
+            # happen in succession and the client does not wait for the STOP to complete before sending
+            # TERMINATE. Altair does this.
+            for existing_op_id, existing_op_lock in list(self._operation_locks.items()):
+                async with self._operation_locks.setdefault(existing_op_id, asyncio.Lock()):
+                    pass
 
         elif msg_type == "START":
             op_id = content["id"]
@@ -364,12 +378,12 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
         elif msg_type == "COMPLETE":
             op_id = content["id"]
 
-            async def on_stop():
+            async def on_complete():
                 # Will until START message processing finishes, if any.
                 async with self._operation_locks.setdefault(op_id, asyncio.Lock()):
                     await self._on_gql_stop(operation_id=op_id)
 
-            task = on_stop()
+            task = on_complete()
 
         elif msg_type == "STOP":
             op_id = content["id"]
@@ -824,6 +838,10 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
         if operation_id not in self._subscriptions:
             return
 
+        # Unsubscribe callback, execute it.
+        subinf = self._subscriptions[operation_id]
+        await self._run_in_worker(subinf.unsubscribed_callback)
+
         # Unsubscribe:
         # - Throw away the subscription from the registry.
         # - Cancel the task which watches over the notification queue.
@@ -832,6 +850,7 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
         subinf = self._subscriptions.pop(operation_id)
         subinf.notifier_task.cancel()
         waitlist.append(subinf.notifier_task)
+
         for group in subinf.groups:
             # Remove the subscription from groups it belongs to. Remove
             # the group itself from the `_sids_by_group` if there are no
@@ -847,11 +866,13 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
                 waitlist.append(
                     self._channel_layer.group_discard(group, self.channel_name)
                 )
+
         await asyncio.wait(waitlist)
 
         # Call the subscription class `unsubscribed` handler in a worker
         # thread, cause it may invoke long-running synchronous tasks.
-        await self._run_in_worker(subinf.unsubscribed_callback)
+        # (this is the original way to call this, but we bumped the other version up above)
+        # await self._run_in_worker(subinf.unsubscribed_callback)
 
         # Send the unsubscription confirmation message.
         await self._send_gql_complete(operation_id)
@@ -904,7 +925,7 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
                 operation_id,
                 "".join(traceback.format_exception(type(ex), ex, tb)).strip(),
             )
-        
+
         if self.subprotocol == GRAPHQL_WS_SUBPROTOCOL:
             type_value = "data"
         elif self.subprotocol == TRANSPORT_WS_SUBPROTOCOL:
