@@ -352,7 +352,10 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
             task = on_start()
 
         elif msg_type == "PING":
-            task = self._send_ping(payload={})
+            task = self._send_pong()
+
+        elif msg_type == "PONG":
+            return
 
         elif msg_type == "SUBSCRIBE":
             op_id = content["id"]
@@ -892,6 +895,11 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
         )
 
     async def _send_ping(self):
+        """Send a keepalive"""
+        self._assert_thread()
+        await self.send_json({"type": "ping", "payload": {}})
+
+    async def _send_pong(self):
         """Sent in reply to the `ping` request."""
         self._assert_thread()
         await self.send_json({"type": "pong", "payload": {}})
@@ -987,7 +995,7 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
         if self.subprotocol == GRAPHQL_WS_SUBPROTOCOL:
             await self.send_json({"type": "ka"})
         elif self.subprotocol == TRANSPORT_WS_SUBPROTOCOL:
-            await self._send_ping(payload={})
+            await self._send_ping()
 
     # ------------------------------------------------------------------------ AUXILIARY
 
