@@ -962,7 +962,11 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
     async def _send_gql_connection_keep_alive(self):
         """Send the keepalive (ping) message."""
         self._assert_thread()
-        await self.send_json({"type": "ka"})
+
+        if self.subprotocol == GRAPHQL_WS_SUBPROTOCOL:
+            await self.send_json({"type": "ka"})
+        elif self.subprotocol == TRANSPORT_WS_SUBPROTOCOL:
+            await self._send_ping(payload={})
 
     # ------------------------------------------------------------------------ AUXILIARY
 
