@@ -55,6 +55,7 @@ import django.db
 import graphql
 import graphql.error
 import graphql.execution.executors.asyncio
+from graphql.language.parser import parse
 import promise
 import rx
 
@@ -126,6 +127,14 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
     # ASGI backend, e.g. in the Redis.
     group_name_prefix = "GRAPHQL_WS_SUBSCRIPTION"
 
+    # Allowed transport protocols
+    # I think we broke the graphql-ws one, so use with caution
+    # (that's the old protocol, the new one seems to work fine.)
+    allowed_graphql_protocols = [
+        GRAPHQL_WS_SUBPROTOCOL,
+        TRANSPORT_WS_SUBPROTOCOL
+    ]
+
     # GraphQL middleware.
     # Typically a list of functions (callables) like:
     # ```python
@@ -182,6 +191,8 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
         notifier_task: asyncio.Task
         # The callback to invoke when client unsubscribes.
         unsubscribed_callback: Callable[[], None]
+        # Query to return when subscribing
+        query_on_subscribe: List[str]
 
     def __init__(self, *args, **kwargs):
         """Consumer constructor."""
@@ -229,7 +240,7 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
         # starting with Python 3.7 it is a bytes. This can be a proper
         # change or just a bug in the Channels to be fixed. So let's
         # accept both variants until it becomes clear.
-        for protocol in [GRAPHQL_WS_SUBPROTOCOL, TRANSPORT_WS_SUBPROTOCOL]:
+        for protocol in self.allowed_graphql_protocols:
             if protocol in self.scope["subprotocols"]:
                 self.subprotocol = protocol
 
@@ -703,6 +714,50 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
                         errors=self.subscription_confirmation_message["errors"],
                     )
 
+                # If this subscription is supposed to mirror a query for an initial response
+                # make that happen here. We are pretty much just running the query and returning
+                # the response.
+                query_on_subscribe = self._subscriptions[operation_id].query_on_subscribe()
+                if query_on_subscribe:
+                    # Query on subscribe should be a static method that returns a list or string of the
+                    # name of the query we are mirroring. They must have the same arguments as the
+                    # subscription.
+                    if type(query_on_subscribe) != list:
+                        query_on_subscribe = [query_on_subscribe, ]
+    
+                    # "contactSubscrpition" for replacement below
+                    parsed_query = parse(query)
+                    subscription_selection_name = parsed_query.definitions[0].selection_set.selections[0].name.value
+
+                    for query_on_subscribe_string in query_on_subscribe:
+                        query_on_subscribe_query = query.replace("subscription", "query", 1).replace(subscription_selection_name, query_on_subscribe_string, 1)
+
+                        query_result = await self._run_in_worker(
+                            lambda: graphql.graphql(
+                                self.schema,
+                                request_string=query_on_subscribe_query,
+                                operation_name=op_name,
+                                variables=variables,
+                                context=context,
+                                # NOTE: Wrap with `wrap_in_promise=False`, otherwise
+                                # it raises `GraphQLError` with message:
+                                # "Subscription must return Async Iterable or
+                                # Observable. Received: <Promise...". I do not get
+                                # why it wraps it in promise by default.
+                                middleware=graphql.middlewares(
+                                    register_middleware, *self.middleware, wrap_in_promise=False
+                                ),
+                                # allow_subscriptions=False,
+                                executor=graphql.execution.executors.asyncio.AsyncioExecutor(),
+                            )
+                        )
+
+                        await self._send_gql_data(
+                            operation_id,
+                            query_result.data,
+                            query_result.errors,
+                        )
+
                 # Subscribe to the observable.
                 # NOTE: The function `on_next` is called from a
                 # threadpool which processes all GraphQL requests. So we
@@ -733,6 +788,7 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
         publish_callback,
         unsubscribed_callback,
         notification_queue_limit=None,
+        query_on_subscribe=None,
     ):
         """Register a new subscription when client subscribes.
 
@@ -815,6 +871,7 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
             unsubscribed_callback=unsubscribed_callback,
             notification_queue=notification_queue,
             notifier_task=notifier_task,
+            query_on_subscribe=query_on_subscribe,
         )
 
         await asyncio.wait(waitlist)

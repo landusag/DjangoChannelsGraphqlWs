@@ -350,11 +350,13 @@ class Subscription(graphene.ObjectType):
 
         unsubscribed = unsubscribed or getattr(cls, "unsubscribed", None)
 
+        query_on_subscribe = getattr(cls, "query_on_subscribe", None)
+
         if _meta.fields:
             _meta.fields.update(fields)
         else:
             _meta.fields = fields
-
+        
         # Auxiliary alias.
         get_function = graphene.utils.get_unbound_function.get_unbound_function
 
@@ -365,6 +367,7 @@ class Subscription(graphene.ObjectType):
         _meta.subscribe = get_function(subscribe)
         _meta.publish = get_function(publish)
         _meta.unsubscribed = get_function(unsubscribed)
+        _meta.query_on_subscribe = get_function(query_on_subscribe)
 
         super().__init_subclass_with_meta__(_meta=_meta, **options)
 
@@ -434,11 +437,17 @@ class Subscription(graphene.ObjectType):
             # `subscribe`.
             return result
 
+        def query_on_subscribe():
+            if cls._meta.query_on_subscribe is None:
+                return None
+            return cls._meta.query_on_subscribe()
+
         return register_subscription(
             groups,
             publish_callback,
             unsubscribed_callback,
             cls.notification_queue_limit,
+            query_on_subscribe=query_on_subscribe,
         )
 
     @classmethod
@@ -507,3 +516,4 @@ class SubscriptionOptions(graphene.types.objecttype.ObjectTypeOptions):
     output = None
     subscribe = None
     publish = None
+    query_on_subscribe = None
