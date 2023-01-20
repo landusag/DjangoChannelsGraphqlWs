@@ -245,7 +245,9 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
                 self.subprotocol = protocol
 
         if not self.subprotocol:
-            raise Exception(f"WebSocket client does not request for a known subprotocol.")
+            raise graphql.error.GraphQLError(
+                f"Unknown or unsupported websocket protocol"
+            )
 
         # Accept connection with the GraphQL-specific subprotocol.
         await self.accept(subprotocol=self.subprotocol)
@@ -724,13 +726,25 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
                     # subscription.
                     if type(query_on_subscribe) != list:
                         query_on_subscribe = [query_on_subscribe, ]
-    
+
                     # "contactSubscrpition" for replacement below
                     parsed_query = parse(query)
-                    subscription_selection_name = parsed_query.definitions[0].selection_set.selections[0].name.value
+                    subscription_selection = parsed_query.definitions[0].selection_set.selections[0].name.value
 
-                    for query_on_subscribe_string in query_on_subscribe:
-                        query_on_subscribe_query = query.replace("subscription", "query", 1).replace(subscription_selection_name, query_on_subscribe_string, 1)
+                    for query_on_subscribe_type_and_query_string in query_on_subscribe:
+                        if ":" not in query_on_subscribe_type_and_query_string:
+                            raise Exception("query_on_subscribe must use '<mutation|query>:<mutation/query name>' format.")
+
+                        # Split the query_on_subscribe value in half by the : character.
+                        # Valid formats are something like "query:ticketDetail" or "mutation:twilioLocking"
+                        query_on_subscribe_type, query_on_subscribe_selection = query_on_subscribe_type_and_query_string.split(":")
+
+                        if query_on_subscribe_type not in ["mutation", "query"]:
+                            raise Exception("query_on_subscribe must use '<mutation|query>:<mutation/query name>' format. You specified something that was not query or mutation.")
+
+                        # Replace the subscription operation with query/mutation.
+                        # Replace the name of the selection with the one from the query_on_subscribe value.
+                        query_on_subscribe_query = query.replace("subscription", query_on_subscribe_type, 1).replace(subscription_selection, query_on_subscribe_selection, 1)
 
                         query_result = await self._run_in_worker(
                             lambda: graphql.graphql(
