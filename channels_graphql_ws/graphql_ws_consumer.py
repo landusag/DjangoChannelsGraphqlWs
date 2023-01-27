@@ -766,6 +766,9 @@ class GraphqlWsConsumer(ch_websocket.AsyncJsonWebsocketConsumer):
                             )
                         )
 
+                        if type(query_result.data) == dict and query_on_subscribe_selection in query_result.data:
+                            query_result.data[subscription_selection] = query_result.data.pop(query_on_subscribe_selection)
+
                         await self._send_gql_data(
                             operation_id,
                             query_result.data,
